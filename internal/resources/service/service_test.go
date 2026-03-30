@@ -3,66 +3,72 @@ package service
 import (
 	"testing"
 
-	"github.com/home-operations/gatus-sidecar/internal/config"
-	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/home-operations/gatus-sidecar/internal/config"
+	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 )
 
-func TestURLExtractor(t *testing.T) {
+func TestEndpointExtractor(t *testing.T) {
 	tests := []struct {
-		name string
-		obj  metav1.Object
-		want string
+		name     string
+		obj      metav1.Object
+		wantURL  string
+		wantHost string
+		wantPath string
+		wantErr  bool
 	}{
 		{
 			name: "extracts URL from service with TCP port",
 			obj: &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "my-service",
-					Namespace: "production",
-				},
-				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{
-						{
-							Port:     8080,
-							Protocol: corev1.ProtocolTCP,
-						},
-					},
-				},
-			},
-			want: "tcp://my-service.production.svc:8080",
-		},
-		{
-			name: "extracts URL from service with UDP port",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "dns-service",
-					Namespace: "kube-system",
-				},
-				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{
-						{
-							Port:     53,
-							Protocol: corev1.ProtocolUDP,
-						},
-					},
-				},
-			},
-			want: "udp://dns-service.kube-system.svc:53",
-		},
-		{
-			name: "returns empty for service without ports",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "headless-service",
 					Namespace: "default",
 				},
 				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{},
+					Ports: []corev1.ServicePort{
+						{
+							Name: "http",
+							Port: 80,
+						},
+					},
 				},
 			},
-			want: "",
+			wantURL:  "http://my-service.default.svc:80",
+			wantHost: "my-service.default.svc",
+			wantPath: "/",
+		},
+		{
+			name: "extracts URL from service with HTTPS port",
+			obj: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "secure-service",
+					Namespace: "prod",
+				},
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{
+							Name: "https",
+							Port: 443,
+						},
+					},
+				},
+			},
+			wantURL:  "https://secure-service.prod.svc:443",
+			wantHost: "secure-service.prod.svc",
+			wantPath: "/",
+		},
+		{
+			name: "returns nil for service without ports",
+			obj: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "no-port-service",
+					Namespace: "default",
+				},
+				Spec: corev1.ServiceSpec{},
+			},
+			wantURL: "",
 		},
 		{
 			name: "uses first port when multiple ports",
@@ -74,81 +80,74 @@ func TestURLExtractor(t *testing.T) {
 				Spec: corev1.ServiceSpec{
 					Ports: []corev1.ServicePort{
 						{
-							Port:     80,
-							Protocol: corev1.ProtocolTCP,
+							Name: "metrics",
+							Port: 9090,
 						},
 						{
-							Port:     443,
-							Protocol: corev1.ProtocolTCP,
+							Name: "http",
+							Port: 80,
 						},
 					},
 				},
 			},
-			want: "tcp://multi-port.default.svc:80",
+			wantURL:  "http://multi-port.default.svc:9090",
+			wantHost: "multi-port.default.svc",
+			wantPath: "/",
 		},
 		{
-			name: "returns empty for non-service object",
-			obj:  &corev1.Pod{},
-			want: "",
+			name:    "returns nil for non-service object",
+			obj:     &metav1.ObjectMeta{},
+			wantURL: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := urlExtractor(tt.obj)
-			if got != tt.want {
-				t.Errorf("urlExtractor() = %v, want %v", got, tt.want)
+			endpoints := endpointExtractor(tt.obj)
+			if tt.wantURL == "" {
+				if len(endpoints) != 0 {
+					t.Errorf("endpointExtractor() = %v, want nil", endpoints)
+				}
+				return
+			}
+
+			if len(endpoints) != 1 {
+				t.Fatalf("endpointExtractor() returned %d endpoints, want 1", len(endpoints))
+			}
+
+			e := endpoints[0]
+			if e.URL != tt.wantURL {
+				t.Errorf("endpointExtractor() URL = %v, want %v", e.URL, tt.wantURL)
+			}
+			if e.Host != tt.wantHost {
+				t.Errorf("endpointExtractor() Host = %v, want %v", e.Host, tt.wantHost)
+			}
+			if e.Path != tt.wantPath {
+				t.Errorf("endpointExtractor() Path = %v, want %v", e.Path, tt.wantPath)
 			}
 		})
 	}
 }
 
 func TestConditionFunc(t *testing.T) {
+	def := Definition()
 	cfg := &config.Config{}
-	obj := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "test"},
-	}
+	svc := &corev1.Service{}
 	e := &endpoint.Endpoint{}
 
-	conditionFunc(cfg, obj, e)
+	def.ConditionFunc(cfg, svc, e)
 
-	if len(e.Conditions) != 1 {
-		t.Errorf("Expected 1 condition, got %d", len(e.Conditions))
-	}
-	if e.Conditions[0] != "[CONNECTED] == true" {
-		t.Errorf("Condition = %v, want [CONNECTED] == true", e.Conditions[0])
+	if len(e.Conditions) != 1 || e.Conditions[0] != "[STATUS] == 200" {
+		t.Errorf("ConditionFunc() conditions = %v, want [[STATUS] == 200]", e.Conditions)
 	}
 }
 
 func TestDefinition(t *testing.T) {
 	def := Definition()
-
-	if def.GVR.Group != "" {
-		t.Errorf("GVR.Group = %v, want empty string", def.GVR.Group)
-	}
-	if def.GVR.Version != "v1" {
-		t.Errorf("GVR.Version = %v, want v1", def.GVR.Version)
-	}
 	if def.GVR.Resource != "services" {
-		t.Errorf("GVR.Resource = %v, want services", def.GVR.Resource)
+		t.Errorf("Definition() resource = %v, want services", def.GVR.Resource)
 	}
-	if def.URLExtractor == nil {
-		t.Error("URLExtractor should not be nil")
-	}
-	if def.ConditionFunc == nil {
-		t.Error("ConditionFunc should not be nil")
-	}
-	if def.AutoConfigFunc == nil {
-		t.Error("AutoConfigFunc should not be nil")
-	}
-
-	cfg := &config.Config{AutoService: true}
-	if !def.AutoConfigFunc(cfg) {
-		t.Error("AutoConfigFunc should return true when AutoService is enabled")
-	}
-
-	cfg.AutoService = false
-	if def.AutoConfigFunc(cfg) {
-		t.Error("AutoConfigFunc should return false when AutoService is disabled")
+	if def.EndpointExtractor == nil {
+		t.Error("Definition() EndpointExtractor is nil")
 	}
 }

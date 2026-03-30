@@ -31,14 +31,14 @@ func Definition() *resources.ResourceDefinition {
 			Version:  "v1",
 			Resource: "ingresses",
 		},
-		TargetType:      reflect.TypeOf(networkingv1.Ingress{}),
-		ConvertFunc:     resources.CreateConvertFunc(reflect.TypeOf(networkingv1.Ingress{})),
-		AutoConfigFunc:  func(cfg *config.Config) bool { return cfg.AutoIngress },
-		FilterFunc:      filterFunc,
-		URLExtractor:    urlExtractor,
-		ConditionFunc:   conditionFunc,
-		GuardedFunc:     guardedFunc,
-		ParentExtractor: parentExtractor,
+		TargetType:        reflect.TypeOf(networkingv1.Ingress{}),
+		ConvertFunc:       resources.CreateConvertFunc(reflect.TypeOf(networkingv1.Ingress{})),
+		AutoConfigFunc:    func(cfg *config.Config) bool { return cfg.AutoIngress },
+		FilterFunc:        filterFunc,
+		EndpointExtractor: endpointExtractor,
+		ConditionFunc:     conditionFunc,
+		GuardedFunc:       guardedFunc,
+		ParentExtractor:   parentExtractor,
 	}
 }
 
@@ -56,24 +56,51 @@ func filterFunc(obj metav1.Object, cfg *config.Config) bool {
 	return true
 }
 
-func urlExtractor(obj metav1.Object) string {
+func endpointExtractor(obj metav1.Object) []*endpoint.Endpoint {
 	ingress, ok := obj.(*networkingv1.Ingress)
 	if !ok {
-		return ""
+		return nil
 	}
 
-	hostname := getFirstHostname(ingress)
-	if hostname == "" {
-		return ""
+	var endpoints []*endpoint.Endpoint
+
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+
+		protocol := determineProtocol(ingress, rule.Host)
+		baseURL := rule.Host
+		if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+			baseURL = fmt.Sprintf("%s://%s", protocol, baseURL)
+		}
+
+		if rule.HTTP != nil {
+			for _, path := range rule.HTTP.Paths {
+				p := path.Path
+				if p == "" {
+					p = "/"
+				}
+				
+				endpoints = append(endpoints, &endpoint.Endpoint{
+					Name: ingress.Name,
+					URL:  baseURL + p,
+					Host: rule.Host,
+					Path: p,
+				})
+			}
+		} else {
+			// No HTTP paths defined, just use the host
+			endpoints = append(endpoints, &endpoint.Endpoint{
+				Name: ingress.Name,
+				URL:  baseURL,
+				Host: rule.Host,
+				Path: "/",
+			})
+		}
 	}
 
-	protocol := determineProtocol(ingress, hostname)
-
-	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
-		return fmt.Sprintf("%s://%s", protocol, hostname)
-	}
-
-	return hostname
+	return endpoints
 }
 
 func conditionFunc(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
@@ -81,8 +108,8 @@ func conditionFunc(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) 
 }
 
 func guardedFunc(obj metav1.Object, e *endpoint.Endpoint) {
-	if ingress, ok := obj.(*networkingv1.Ingress); ok {
-		applyGuardedTemplate(getFirstHostname(ingress), e)
+	if _, ok := obj.(*networkingv1.Ingress); ok {
+		applyGuardedTemplate(e.Host, e)
 	}
 }
 
@@ -96,15 +123,6 @@ func applyGuardedTemplate(dnsQueryName string, e *endpoint.Endpoint) {
 }
 
 // Helper functions
-
-func getFirstHostname(ingress *networkingv1.Ingress) string {
-	for _, rule := range ingress.Spec.Rules {
-		if rule.Host != "" {
-			return rule.Host
-		}
-	}
-	return ""
-}
 
 func determineProtocol(ingress *networkingv1.Ingress, hostname string) string {
 	if hasTLS(ingress, hostname) {

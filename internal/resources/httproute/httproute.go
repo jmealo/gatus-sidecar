@@ -29,14 +29,14 @@ func Definition() *resources.ResourceDefinition {
 			Version:  "v1",
 			Resource: "httproutes",
 		},
-		TargetType:      reflect.TypeOf(gatewayv1.HTTPRoute{}),
-		ConvertFunc:     resources.CreateConvertFunc(reflect.TypeOf(gatewayv1.HTTPRoute{})),
-		AutoConfigFunc:  func(cfg *config.Config) bool { return cfg.AutoHTTPRoute },
-		FilterFunc:      filterFunc,
-		URLExtractor:    urlExtractor,
-		ConditionFunc:   conditionFunc,
-		GuardedFunc:     guardedFunc,
-		ParentExtractor: parentExtractor,
+		TargetType:        reflect.TypeOf(gatewayv1.HTTPRoute{}),
+		ConvertFunc:       resources.CreateConvertFunc(reflect.TypeOf(gatewayv1.HTTPRoute{})),
+		AutoConfigFunc:    func(cfg *config.Config) bool { return cfg.AutoHTTPRoute },
+		FilterFunc:        filterFunc,
+		EndpointExtractor: endpointExtractor,
+		ConditionFunc:     conditionFunc,
+		GuardedFunc:       guardedFunc,
+		ParentExtractor:   parentExtractor,
 	}
 }
 
@@ -54,22 +54,55 @@ func filterFunc(obj metav1.Object, cfg *config.Config) bool {
 	return true
 }
 
-func urlExtractor(obj metav1.Object) string {
+func endpointExtractor(obj metav1.Object) []*endpoint.Endpoint {
 	route, ok := obj.(*gatewayv1.HTTPRoute)
 	if !ok {
-		return ""
+		return nil
 	}
 
-	hostname := getFirstHostname(route)
-	if hostname == "" {
-		return ""
+	var endpoints []*endpoint.Endpoint
+
+	// If no hostnames are defined, we can't really extract a URL
+	if len(route.Spec.Hostnames) == 0 {
+		return nil
 	}
 
-	if !strings.HasPrefix(hostname, "http://") && !strings.HasPrefix(hostname, "https://") {
-		return "https://" + hostname
+	for _, hostname := range route.Spec.Hostnames {
+		h := string(hostname)
+		baseURL := h
+		if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+			baseURL = "https://" + baseURL
+		}
+
+		for _, rule := range route.Spec.Rules {
+			if len(rule.Matches) == 0 {
+				// No matches means all paths (effectively /)
+				endpoints = append(endpoints, &endpoint.Endpoint{
+					Name: route.Name,
+					URL:  baseURL + "/",
+					Host: h,
+					Path: "/",
+				})
+				continue
+			}
+
+			for _, match := range rule.Matches {
+				p := "/"
+				if match.Path != nil && match.Path.Value != nil {
+					p = *match.Path.Value
+				}
+				
+				endpoints = append(endpoints, &endpoint.Endpoint{
+					Name: route.Name,
+					URL:  baseURL + p,
+					Host: h,
+					Path: p,
+				})
+			}
+		}
 	}
 
-	return hostname
+	return endpoints
 }
 
 func conditionFunc(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
@@ -77,8 +110,8 @@ func conditionFunc(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) 
 }
 
 func guardedFunc(obj metav1.Object, e *endpoint.Endpoint) {
-	if route, ok := obj.(*gatewayv1.HTTPRoute); ok {
-		applyGuardedTemplate(getFirstHostname(route), e)
+	if _, ok := obj.(*gatewayv1.HTTPRoute); ok {
+		applyGuardedTemplate(e.Host, e)
 	}
 }
 
@@ -125,13 +158,6 @@ func parentExtractor(ctx context.Context, obj metav1.Object, client dynamic.Inte
 }
 
 // Helper functions
-
-func getFirstHostname(route *gatewayv1.HTTPRoute) string {
-	if len(route.Spec.Hostnames) == 0 {
-		return ""
-	}
-	return string(route.Spec.Hostnames[0])
-}
 
 func referencesGateway(route *gatewayv1.HTTPRoute, gatewayName string) bool {
 	for _, parent := range route.Spec.ParentRefs {

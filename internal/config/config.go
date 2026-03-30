@@ -6,22 +6,24 @@ import (
 )
 
 type Config struct {
-	Mode               string
-	Namespace          string
-	GatewayName        string
-	IngressClass       string
-	EnableHTTPRoute    bool
-	EnableIngress      bool
-	EnableService      bool
-	EnableIngressRoute bool
-	AutoHTTPRoute      bool
-	AutoIngress        bool
-	AutoService        bool
-	AutoIngressRoute   bool
-	Output             string
-	DefaultInterval    time.Duration
-	TemplateAnnotation string
-	EnabledAnnotation  string
+	Mode                 string
+	Namespace            string
+	GatewayName          string
+	IngressClass         string
+	EnableHTTPRoute      bool
+	EnableIngress        bool
+	EnableService        bool
+	EnableIngressRoute   bool
+	AutoHTTPRoute        bool
+	AutoIngress          bool
+	AutoService          bool
+	AutoIngressRoute     bool
+	Output               string
+	DefaultInterval      time.Duration
+	TemplateAnnotation   string
+	EnabledAnnotation    string
+	DefaultNameTemplate  string
+	DefaultGroupTemplate string
 }
 
 func Load() *Config {
@@ -42,6 +44,8 @@ func Load() *Config {
 	flag.DurationVar(&cfg.DefaultInterval, "default-interval", time.Minute, "Default interval value for endpoints")
 	flag.StringVar(&cfg.TemplateAnnotation, "annotation-config", "gatus.home-operations.com/endpoint", "Annotation key for YAML config override")
 	flag.StringVar(&cfg.EnabledAnnotation, "annotation-enabled", "gatus.home-operations.com/enabled", "Annotation key for enabling/disabling resource processing")
+	flag.StringVar(&cfg.DefaultNameTemplate, "default-name-template", "{{.Name}}", "Default name template for endpoints")
+	flag.StringVar(&cfg.DefaultGroupTemplate, "default-group-template", "{{.Namespace}}", "Default group template for endpoints")
 
 	flag.CommandLine.Init("", flag.ExitOnError)
 	flag.Parse()

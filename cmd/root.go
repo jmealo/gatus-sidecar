@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
+	"time"
 
 	"github.com/home-operations/gatus-sidecar/internal/config"
 	"github.com/home-operations/gatus-sidecar/internal/controller"
@@ -17,6 +17,7 @@ import (
 	"github.com/home-operations/gatus-sidecar/internal/resources/service"
 	"github.com/home-operations/gatus-sidecar/internal/state"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -41,6 +42,12 @@ func main() {
 	// Create a single shared state manager
 	stateManager := state.NewManager(cfg.Output)
 
+	// Start state manager background writer
+	go stateManager.Start(ctx)
+
+	// Create dynamic informer factory
+	informerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dc, 0, cfg.Namespace, nil)
+
 	// Initialize controllers slice
 	controllers := []*controller.Controller{}
 
@@ -49,16 +56,16 @@ func main() {
 
 	// Conditionally register controllers based on config
 	if cfg.EnableHTTPRoute || cfg.AutoHTTPRoute || defaultControllers {
-		controllers = append(controllers, controller.New(httproute.Definition(), stateManager, dc))
+		controllers = append(controllers, controller.New(httproute.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
 	if cfg.EnableIngress || cfg.AutoIngress || defaultControllers {
-		controllers = append(controllers, controller.New(ingress.Definition(), stateManager, dc))
+		controllers = append(controllers, controller.New(ingress.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
 	if cfg.EnableService || cfg.AutoService || defaultControllers {
-		controllers = append(controllers, controller.New(service.Definition(), stateManager, dc))
+		controllers = append(controllers, controller.New(service.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
 	if cfg.EnableIngressRoute || cfg.AutoIngressRoute || defaultControllers {
-		controllers = append(controllers, controller.New(ingressroute.Definition(), stateManager, dc))
+		controllers = append(controllers, controller.New(ingressroute.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
 
 	// If no controllers are enabled, log a warning and exit
@@ -67,47 +74,40 @@ func main() {
 		return
 	}
 
-	// Run all controllers concurrently
-	if err := runControllers(ctx, cfg, controllers); err != nil {
-		slog.Error("Controller execution failed", "error", err)
-		os.Exit(1)
-	}
+	// Start informer factory
+	informerFactory.Start(ctx.Done())
 
+	// Wait for all informers to sync
+	slog.Info("Waiting for informers to sync")
+	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer syncCancel()
+	
+	for gvr, synced := range informerFactory.WaitForCacheSync(syncCtx.Done()) {
+		if !synced {
+			slog.Error("Failed to sync informer cache", "resource", gvr.Resource)
+			os.Exit(1)
+		}
+	}
+	slog.Info("Informers synced")
+
+	// Run all controllers concurrently
+	runControllers(ctx, cfg, controllers)
+
+	// Keep main running until context is cancelled
+	<-ctx.Done()
 	slog.Info("All controllers have finished successfully")
 }
 
-func runControllers(ctx context.Context, cfg *config.Config, controllers []*controller.Controller) error {
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(controllers))
-
+func runControllers(ctx context.Context, cfg *config.Config, controllers []*controller.Controller) {
 	for _, c := range controllers {
-		wg.Go(func() {
-			slog.Info("Starting controller", "controller", c.GetResource())
+		go func(ctrl *controller.Controller) {
+			slog.Info("Starting controller", "controller", ctrl.GetResource())
 
-			if err := c.Run(ctx, cfg); err != nil {
-				slog.Error("Controller error", "controller", c.GetResource(), "error", err)
-				errChan <- err
+			if err := ctrl.Run(ctx, cfg); err != nil {
+				slog.Error("Controller error", "controller", ctrl.GetResource(), "error", err)
 			}
-		})
+		}(c)
 	}
-
-	// Wait for either all controllers to finish or an error to occur
-	go func() {
-		wg.Wait()
-		close(errChan)
-	}()
-
-	// Return the first error encountered
-	select {
-	case err := <-errChan:
-		if err != nil {
-			return err
-		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	return nil
 }
 
 func getKubeConfig() (*rest.Config, error) {

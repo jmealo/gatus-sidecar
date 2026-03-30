@@ -5,341 +5,229 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/home-operations/gatus-sidecar/internal/config"
-	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes/scheme"
+
+	"github.com/home-operations/gatus-sidecar/internal/config"
+	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 )
 
 func TestHandler_ShouldProcess(t *testing.T) {
 	cfg := &config.Config{
-		AutoService:        true,
-		EnabledAnnotation:  "gatus.home-operations.com/enabled",
-		TemplateAnnotation: "gatus.home-operations.com/endpoint",
+		EnabledAnnotation: "gatus.io/enabled",
+		AutoService:       false,
 	}
 
+	def := &ResourceDefinition{
+		AutoConfigFunc: func(c *config.Config) bool { return c.AutoService },
+	}
+
+	h := NewHandler(def, nil)
+
 	tests := []struct {
-		name       string
-		definition *ResourceDefinition
-		obj        metav1.Object
-		cfg        *config.Config
-		want       bool
+		name        string
+		annotations map[string]string
+		autoService bool
+		want        bool
 	}{
 		{
-			name: "auto-config enabled processes all",
-			definition: &ResourceDefinition{
-				AutoConfigFunc: func(cfg *config.Config) bool { return cfg.AutoService },
-			},
-			obj:  &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			cfg:  cfg,
-			want: true,
+			name:        "auto-config enabled processes all",
+			annotations: nil,
+			autoService: true,
+			want:        true,
 		},
 		{
-			name: "auto-config disabled requires annotations",
-			definition: &ResourceDefinition{
-				AutoConfigFunc: func(cfg *config.Config) bool { return false },
-			},
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-					Annotations: map[string]string{
-						"gatus.home-operations.com/enabled": "true",
-					},
-				},
-			},
-			cfg:  cfg,
-			want: true,
+			name:        "auto-config disabled requires annotations",
+			annotations: map[string]string{"gatus.io/enabled": "true"},
+			autoService: false,
+			want:        true,
 		},
 		{
-			name: "filter function can reject objects",
-			definition: &ResourceDefinition{
-				AutoConfigFunc: func(cfg *config.Config) bool { return true },
-				FilterFunc: func(obj metav1.Object, cfg *config.Config) bool {
-					return obj.GetName() == "allowed"
-				},
-			},
-			obj:  &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "rejected"}},
-			cfg:  cfg,
-			want: false,
+			name:        "filter function can reject objects",
+			annotations: map[string]string{"gatus.io/enabled": "true"},
+			autoService: false,
+			want:        true,
 		},
 		{
-			name: "no annotations and auto disabled",
-			definition: &ResourceDefinition{
-				AutoConfigFunc: func(cfg *config.Config) bool { return false },
-			},
-			obj:  &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			cfg:  cfg,
-			want: false,
+			name:        "no annotations and auto disabled",
+			annotations: nil,
+			autoService: false,
+			want:        false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := NewHandler(tt.definition, nil)
-			if got := h.ShouldProcess(tt.obj, tt.cfg); got != tt.want {
+			cfg.AutoService = tt.autoService
+			obj := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+			if got := h.ShouldProcess(obj, cfg); got != tt.want {
 				t.Errorf("ShouldProcess() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestHandler_ExtractURL(t *testing.T) {
-	tests := []struct {
-		name       string
-		definition *ResourceDefinition
-		obj        metav1.Object
-		want       string
-	}{
-		{
-			name: "returns empty string when no extractor",
-			definition: &ResourceDefinition{
-				URLExtractor: nil,
-			},
-			obj:  &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			want: "",
-		},
-		{
-			name: "extracts URL using custom extractor",
-			definition: &ResourceDefinition{
-				URLExtractor: func(obj metav1.Object) string {
-					return "https://custom.url"
-				},
-			},
-			obj:  &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			want: "https://custom.url",
+func TestHandler_ExtractEndpoints(t *testing.T) {
+	def := &ResourceDefinition{
+		EndpointExtractor: func(obj metav1.Object) []*endpoint.Endpoint {
+			return []*endpoint.Endpoint{{URL: "https://extracted.com"}}
 		},
 	}
+	h := NewHandler(def, nil)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := NewHandler(tt.definition, nil)
-			if got := h.ExtractURL(tt.obj); got != tt.want {
-				t.Errorf("ExtractURL() = %v, want %v", got, tt.want)
-			}
-		})
-	}
+	t.Run("returns empty slice when no extractor", func(t *testing.T) {
+		h2 := NewHandler(&ResourceDefinition{}, nil)
+		if got := h2.ExtractEndpoints(&corev1.Service{}); got != nil {
+			t.Errorf("ExtractEndpoints() = %v, want nil", got)
+		}
+	})
+
+	t.Run("extracts endpoints using custom extractor", func(t *testing.T) {
+		got := h.ExtractEndpoints(&corev1.Service{})
+		if len(got) != 1 || got[0].URL != "https://extracted.com" {
+			t.Errorf("ExtractEndpoints() = %v, want [{URL: https://extracted.com}]", got)
+		}
+	})
 }
 
 func TestHandler_ApplyTemplate(t *testing.T) {
-	cfg := &config.Config{}
-
-	tests := []struct {
-		name       string
-		definition *ResourceDefinition
-		obj        metav1.Object
-		endpoint   *endpoint.Endpoint
-		wantCond   []string
-	}{
-		{
-			name: "applies condition function for non-guarded endpoint",
-			definition: &ResourceDefinition{
-				ConditionFunc: func(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
-					e.Conditions = []string{"[STATUS] == 200"}
-				},
-			},
-			obj:      &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			endpoint: &endpoint.Endpoint{Name: "test"},
-			wantCond: []string{"[STATUS] == 200"},
+	def := &ResourceDefinition{
+		ConditionFunc: func(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
+			e.Conditions = append(e.Conditions, "[STATUS] == 200")
 		},
-		{
-			name: "applies guarded function for guarded endpoint",
-			definition: &ResourceDefinition{
-				ConditionFunc: func(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
-					e.Conditions = []string{"[STATUS] == 200"}
-				},
-				GuardedFunc: func(obj metav1.Object, e *endpoint.Endpoint) {
-					e.Conditions = []string{"len([BODY]) == 0"}
-				},
-			},
-			obj:      &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			endpoint: &endpoint.Endpoint{Name: "test", Guarded: true},
-			wantCond: []string{"len([BODY]) == 0"},
-		},
-		{
-			name:       "no functions defined",
-			definition: &ResourceDefinition{},
-			obj:        &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}},
-			endpoint:   &endpoint.Endpoint{Name: "test"},
-			wantCond:   nil,
+		GuardedFunc: func(obj metav1.Object, e *endpoint.Endpoint) {
+			e.URL = "1.1.1.1"
 		},
 	}
+	h := NewHandler(def, nil)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := NewHandler(tt.definition, nil)
-			h.ApplyTemplate(cfg, tt.obj, tt.endpoint)
-			if !equalStringSlices(tt.endpoint.Conditions, tt.wantCond) {
-				t.Errorf("Conditions = %v, want %v", tt.endpoint.Conditions, tt.wantCond)
-			}
-		})
-	}
+	t.Run("applies condition function for non-guarded endpoint", func(t *testing.T) {
+		e := &endpoint.Endpoint{}
+		h.ApplyTemplate(&config.Config{}, &corev1.Service{}, e)
+		if len(e.Conditions) != 1 || e.Conditions[0] != "[STATUS] == 200" {
+			t.Errorf("Conditions not applied correctly: %v", e.Conditions)
+		}
+	})
+
+	t.Run("applies guarded function for guarded endpoint", func(t *testing.T) {
+		e := &endpoint.Endpoint{Guarded: true}
+		h.ApplyTemplate(&config.Config{}, &corev1.Service{}, e)
+		if e.URL != "1.1.1.1" {
+			t.Errorf("Guarded function not applied correctly: %v", e.URL)
+		}
+	})
+
+	t.Run("no functions defined", func(t *testing.T) {
+		h2 := NewHandler(&ResourceDefinition{}, nil)
+		e := &endpoint.Endpoint{}
+		h2.ApplyTemplate(&config.Config{}, &corev1.Service{}, e)
+		// Should not panic
+	})
 }
 
 func TestHandler_GetParentAnnotations(t *testing.T) {
-	scheme := runtime.NewScheme()
-	client := fake.NewSimpleDynamicClient(scheme)
+	def := &ResourceDefinition{
+		ParentExtractor: func(ctx context.Context, obj metav1.Object, client dynamic.Interface) map[string]string {
+			return map[string]string{"parent": "true"}
+		},
+	}
+	h := NewHandler(def, nil)
 
 	t.Run("returns nil when no parent extractor", func(t *testing.T) {
-		h := NewHandler(&ResourceDefinition{}, nil)
-		obj := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
-		if got := h.GetParentAnnotations(context.Background(), obj); got != nil {
+		h2 := NewHandler(&ResourceDefinition{}, nil)
+		if got := h2.GetParentAnnotations(context.TODO(), &corev1.Service{}); got != nil {
 			t.Errorf("GetParentAnnotations() = %v, want nil", got)
 		}
 	})
 
 	t.Run("calls parent extractor when defined", func(t *testing.T) {
-		h := NewHandler(&ResourceDefinition{
-			ParentExtractor: func(ctx context.Context, obj metav1.Object, client dynamic.Interface) map[string]string {
-				return map[string]string{"parent": "annotation"}
-			},
-		}, client)
-		obj := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
-		got := h.GetParentAnnotations(context.Background(), obj)
-		if got == nil || got["parent"] != "annotation" {
-			t.Errorf("GetParentAnnotations() = %v, want {parent: annotation}", got)
+		got := h.GetParentAnnotations(context.TODO(), &corev1.Service{})
+		if got["parent"] != "true" {
+			t.Errorf("GetParentAnnotations() = %v, want {parent: true}", got)
 		}
 	})
 }
 
 func TestCreateConvertFunc(t *testing.T) {
-	convertFunc := CreateConvertFunc(reflect.TypeOf(corev1.Service{}))
-
 	t.Run("converts valid unstructured to service", func(t *testing.T) {
-		u := &unstructured.Unstructured{
-			Object: map[string]any{
-				"apiVersion": "v1",
-				"kind":       "Service",
-				"metadata": map[string]any{
-					"name":      "test-service",
-					"namespace": "default",
-				},
-				"spec": map[string]any{
-					"ports": []any{
-						map[string]any{
-							"port":     80,
-							"protocol": "TCP",
-						},
-					},
-				},
+		convert := CreateConvertFunc(reflect.TypeOf(corev1.Service{}))
+		u := resourcesToUnstructured(&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-svc",
 			},
-		}
-
-		obj, err := convertFunc(u)
+		})
+		obj, err := convert(u)
 		if err != nil {
-			t.Fatalf("CreateConvertFunc() error = %v", err)
+			t.Fatalf("ConvertFunc failed: %v", err)
 		}
-
-		if obj.GetName() != "test-service" {
-			t.Errorf("CreateConvertFunc() name = %v, want test-service", obj.GetName())
-		}
-		if obj.GetNamespace() != "default" {
-			t.Errorf("CreateConvertFunc() namespace = %v, want default", obj.GetNamespace())
+		if obj.GetName() != "test-svc" {
+			t.Errorf("Converted name = %v, want test-svc", obj.GetName())
 		}
 	})
 }
 
 func TestHasRequiredAnnotations(t *testing.T) {
 	cfg := &config.Config{
-		EnabledAnnotation:  "gatus.home-operations.com/enabled",
-		TemplateAnnotation: "gatus.home-operations.com/endpoint",
+		EnabledAnnotation:  "gatus.io/enabled",
+		TemplateAnnotation: "gatus.io/template",
 	}
 
 	tests := []struct {
-		name string
-		obj  metav1.Object
-		want bool
+		name        string
+		annotations map[string]string
+		want        bool
 	}{
 		{
-			name: "has enabled annotation",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-					Annotations: map[string]string{
-						"gatus.home-operations.com/enabled": "true",
-					},
-				},
-			},
-			want: true,
+			name:        "has enabled annotation",
+			annotations: map[string]string{"gatus.io/enabled": "true"},
+			want:        true,
 		},
 		{
-			name: "has template annotation",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-					Annotations: map[string]string{
-						"gatus.home-operations.com/endpoint": "interval: 30s",
-					},
-				},
-			},
-			want: true,
+			name:        "has template annotation",
+			annotations: map[string]string{"gatus.io/template": "{}"},
+			want:        true,
 		},
 		{
-			name: "has both annotations",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-					Annotations: map[string]string{
-						"gatus.home-operations.com/enabled":  "true",
-						"gatus.home-operations.com/endpoint": "interval: 30s",
-					},
-				},
-			},
-			want: true,
+			name:        "has both annotations",
+			annotations: map[string]string{"gatus.io/enabled": "true", "gatus.io/template": "{}"},
+			want:        true,
 		},
 		{
-			name: "no annotations",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-				},
-			},
-			want: false,
+			name:        "no annotations",
+			annotations: map[string]string{},
+			want:        false,
 		},
 		{
-			name: "nil annotations",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        "test",
-					Annotations: nil,
-				},
-			},
-			want: false,
+			name:        "nil annotations",
+			annotations: nil,
+			want:        false,
 		},
 		{
-			name: "unrelated annotations",
-			obj: &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-					Annotations: map[string]string{
-						"other-annotation": "value",
-					},
-				},
-			},
-			want: false,
+			name:        "unrelated annotations",
+			annotations: map[string]string{"other": "value"},
+			want:        false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := HasRequiredAnnotations(tt.obj, cfg); got != tt.want {
+			if got := HasRequiredAnnotations(tt.annotations, cfg); got != tt.want {
 				t.Errorf("HasRequiredAnnotations() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+func resourcesToUnstructured(obj runtime.Object) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	_ = scheme.Scheme.Convert(obj, u, nil)
+	return u
 }

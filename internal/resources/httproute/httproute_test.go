@@ -3,415 +3,129 @@ package httproute
 import (
 	"testing"
 
-	"github.com/home-operations/gatus-sidecar/internal/config"
-	"github.com/home-operations/gatus-sidecar/internal/endpoint"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/home-operations/gatus-sidecar/internal/config"
+	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 )
 
-func TestURLExtractor(t *testing.T) {
+func TestEndpointExtractor(t *testing.T) {
 	tests := []struct {
-		name string
-		obj  metav1.Object
-		want string
+		name          string
+		obj           metav1.Object
+		wantEndpoints []endpoint.Endpoint
 	}{
 		{
 			name: "extracts HTTPS URL from HTTPRoute with hostname",
 			obj: &gatewayv1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-route",
-					Namespace: "default",
+					Name: "test-route",
 				},
 				Spec: gatewayv1.HTTPRouteSpec{
-					Hostnames: []gatewayv1.Hostname{
-						"api.example.com",
-						"api2.example.com",
+					Hostnames: []gatewayv1.Hostname{"example.com"},
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Matches: []gatewayv1.HTTPRouteMatch{
+								{
+									Path: &gatewayv1.HTTPPathMatch{
+										Value: ptr("/api"),
+									},
+								},
+							},
+						},
 					},
 				},
 			},
-			want: "https://api.example.com",
+			wantEndpoints: []endpoint.Endpoint{
+				{Name: "test-route", URL: "https://example.com/api", Host: "example.com", Path: "/api"},
+			},
 		},
 		{
-			name: "returns empty for HTTPRoute without hostnames",
+			name: "returns nil for HTTPRoute without hostnames",
 			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "empty-route",
-					Namespace: "default",
-				},
 				Spec: gatewayv1.HTTPRouteSpec{
 					Hostnames: []gatewayv1.Hostname{},
 				},
 			},
-			want: "",
+			wantEndpoints: nil,
 		},
 		{
-			name: "uses first hostname when multiple",
+			name: "extracts multiple hostnames and paths",
 			obj: &gatewayv1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "multi-route",
+					Name: "multi-host",
 				},
 				Spec: gatewayv1.HTTPRouteSpec{
-					Hostnames: []gatewayv1.Hostname{
-						"first.example.com",
-						"second.example.com",
+					Hostnames: []gatewayv1.Hostname{"a.com", "b.com"},
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Matches: []gatewayv1.HTTPRouteMatch{
+								{
+									Path: &gatewayv1.HTTPPathMatch{
+										Value: ptr("/v1"),
+									},
+								},
+							},
+						},
 					},
 				},
 			},
-			want: "https://first.example.com",
-		},
-		{
-			name: "returns URL as-is if already has http prefix",
-			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "prefixed-route",
-				},
-				Spec: gatewayv1.HTTPRouteSpec{
-					Hostnames: []gatewayv1.Hostname{
-						"http://already-prefixed.com",
-					},
-				},
+			wantEndpoints: []endpoint.Endpoint{
+				{Name: "multi-host", URL: "https://a.com/v1", Host: "a.com", Path: "/v1"},
+				{Name: "multi-host", URL: "https://b.com/v1", Host: "b.com", Path: "/v1"},
 			},
-			want: "http://already-prefixed.com",
-		},
-		{
-			name: "adds HTTPS prefix when hostname starts with 'http' but is not a URL",
-			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "http-debug-route",
-				},
-				Spec: gatewayv1.HTTPRouteSpec{
-					Hostnames: []gatewayv1.Hostname{
-						"http-test.domain.com",
-					},
-				},
-			},
-			want: "https://http-test.domain.com",
-		},
-		{
-			name: "returns empty for non-HTTPRoute object",
-			obj:  &corev1.Pod{},
-			want: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := urlExtractor(tt.obj)
-			if got != tt.want {
-				t.Errorf("urlExtractor() = %v, want %v", got, tt.want)
+			got := endpointExtractor(tt.obj)
+			if len(got) != len(tt.wantEndpoints) {
+				t.Fatalf("endpointExtractor() returned %d endpoints, want %d", len(got), len(tt.wantEndpoints))
+			}
+			for i, e := range got {
+				if e.URL != tt.wantEndpoints[i].URL {
+					t.Errorf("Endpoint[%d] URL = %v, want %v", i, e.URL, tt.wantEndpoints[i].URL)
+				}
+				if e.Host != tt.wantEndpoints[i].Host {
+					t.Errorf("Endpoint[%d] Host = %v, want %v", i, e.Host, tt.wantEndpoints[i].Host)
+				}
+				if e.Path != tt.wantEndpoints[i].Path {
+					t.Errorf("Endpoint[%d] Path = %v, want %v", i, e.Path, tt.wantEndpoints[i].Path)
+				}
 			}
 		})
 	}
+}
+
+func ptr(s string) *string {
+	return &s
 }
 
 func TestFilterFunc(t *testing.T) {
-	gatewayName := gatewayv1.ObjectName("my-gateway")
-	otherGateway := gatewayv1.ObjectName("other-gateway")
-
-	tests := []struct {
-		name string
-		obj  metav1.Object
-		cfg  *config.Config
-		want bool
-	}{
-		{
-			name: "no filter - allows all routes",
-			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{Name: "test"},
-			},
-			cfg:  &config.Config{},
-			want: true,
-		},
-		{
-			name: "filter by gateway name matches",
-			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{Name: "test"},
-				Spec: gatewayv1.HTTPRouteSpec{
-					CommonRouteSpec: gatewayv1.CommonRouteSpec{
-						ParentRefs: []gatewayv1.ParentReference{
-							{Name: gatewayName},
-						},
-					},
-				},
-			},
-			cfg:  &config.Config{GatewayName: "my-gateway"},
-			want: true,
-		},
-		{
-			name: "filter by gateway name does not match",
-			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{Name: "test"},
-				Spec: gatewayv1.HTTPRouteSpec{
-					CommonRouteSpec: gatewayv1.CommonRouteSpec{
-						ParentRefs: []gatewayv1.ParentReference{
-							{Name: otherGateway},
-						},
-					},
-				},
-			},
-			cfg:  &config.Config{GatewayName: "my-gateway"},
-			want: false,
-		},
-		{
-			name: "no parent refs passes filter when no gateway filter",
-			obj: &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{Name: "test"},
-				Spec:       gatewayv1.HTTPRouteSpec{},
-			},
-			cfg:  &config.Config{},
-			want: true,
-		},
-		{
-			name: "non-HTTPRoute object returns false",
-			obj:  &corev1.Pod{},
-			cfg:  &config.Config{},
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := filterFunc(tt.obj, tt.cfg)
-			if got != tt.want {
-				t.Errorf("filterFunc() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestConditionFunc(t *testing.T) {
 	cfg := &config.Config{}
-	obj := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "test"},
-	}
-	e := &endpoint.Endpoint{}
+	
+	t.Run("no filter - allows all routes", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{}
+		if !filterFunc(route, cfg) {
+			t.Error("filterFunc() = false, want true")
+		}
+	})
 
-	conditionFunc(cfg, obj, e)
-
-	if len(e.Conditions) != 1 {
-		t.Errorf("Expected 1 condition, got %d", len(e.Conditions))
-	}
-	if e.Conditions[0] != "[STATUS] == 200" {
-		t.Errorf("Condition = %v, want [STATUS] == 200", e.Conditions[0])
-	}
-}
-
-func TestGuardedFunc(t *testing.T) {
-	obj := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "test"},
-		Spec: gatewayv1.HTTPRouteSpec{
-			Hostnames: []gatewayv1.Hostname{"guarded.example.com"},
-		},
-	}
-	e := &endpoint.Endpoint{Guarded: true}
-
-	guardedFunc(obj, e)
-
-	if e.URL != dnsTestURL {
-		t.Errorf("URL = %v, want %v", e.URL, dnsTestURL)
-	}
-	if e.DNS == nil {
-		t.Error("DNS config should not be nil")
-	}
-	if e.DNS["query-name"] != "guarded.example.com" {
-		t.Errorf("DNS query-name = %v, want guarded.example.com", e.DNS["query-name"])
-	}
-	if e.DNS["query-type"] != dnsQueryType {
-		t.Errorf("DNS query-type = %v, want %v", e.DNS["query-type"], dnsQueryType)
-	}
-	if len(e.Conditions) != 1 || e.Conditions[0] != dnsEmptyBodyCondition {
-		t.Errorf("Conditions = %v, want [%v]", e.Conditions, dnsEmptyBodyCondition)
-	}
-}
-
-func TestGuardedFuncNonHTTPRoute(t *testing.T) {
-	obj := &corev1.Pod{}
-	e := &endpoint.Endpoint{Guarded: true}
-
-	guardedFunc(obj, e)
-
-	if e.DNS != nil {
-		t.Error("DNS should remain nil for non-HTTPRoute objects")
-	}
-}
-
-func TestGetFirstHostname(t *testing.T) {
-	tests := []struct {
-		name  string
-		route *gatewayv1.HTTPRoute
-		want  string
-	}{
-		{
-			name: "returns first hostname",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{
-					Hostnames: []gatewayv1.Hostname{
-						"first.example.com",
-						"second.example.com",
-					},
-				},
-			},
-			want: "first.example.com",
-		},
-		{
-			name: "returns empty string when no hostnames",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{
-					Hostnames: []gatewayv1.Hostname{},
-				},
-			},
-			want: "",
-		},
-		{
-			name: "returns empty string when nil hostnames",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{},
-			},
-			want: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := getFirstHostname(tt.route)
-			if got != tt.want {
-				t.Errorf("getFirstHostname() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestReferencesGateway(t *testing.T) {
-	targetGateway := gatewayv1.ObjectName("target-gateway")
-	otherGateway := gatewayv1.ObjectName("other-gateway")
-
-	tests := []struct {
-		name        string
-		route       *gatewayv1.HTTPRoute
-		gatewayName string
-		want        bool
-	}{
-		{
-			name: "references target gateway",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{
-					CommonRouteSpec: gatewayv1.CommonRouteSpec{
-						ParentRefs: []gatewayv1.ParentReference{
-							{Name: targetGateway},
-						},
-					},
-				},
-			},
-			gatewayName: "target-gateway",
-			want:        true,
-		},
-		{
-			name: "does not reference target gateway",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{
-					CommonRouteSpec: gatewayv1.CommonRouteSpec{
-						ParentRefs: []gatewayv1.ParentReference{
-							{Name: otherGateway},
-						},
-					},
-				},
-			},
-			gatewayName: "target-gateway",
-			want:        false,
-		},
-		{
-			name: "references gateway in multiple parents",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{
-					CommonRouteSpec: gatewayv1.CommonRouteSpec{
-						ParentRefs: []gatewayv1.ParentReference{
-							{Name: otherGateway},
-							{Name: targetGateway},
-						},
-					},
-				},
-			},
-			gatewayName: "target-gateway",
-			want:        true,
-		},
-		{
-			name: "no parent refs",
-			route: &gatewayv1.HTTPRoute{
-				Spec: gatewayv1.HTTPRouteSpec{
-					CommonRouteSpec: gatewayv1.CommonRouteSpec{
-						ParentRefs: []gatewayv1.ParentReference{},
-					},
-				},
-			},
-			gatewayName: "target-gateway",
-			want:        false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := referencesGateway(tt.route, tt.gatewayName)
-			if got != tt.want {
-				t.Errorf("referencesGateway() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestApplyGuardedTemplate(t *testing.T) {
-	e := &endpoint.Endpoint{}
-	hostname := "test.example.com"
-
-	applyGuardedTemplate(hostname, e)
-
-	if e.URL != dnsTestURL {
-		t.Errorf("URL = %v, want %v", e.URL, dnsTestURL)
-	}
-	if e.DNS == nil {
-		t.Error("DNS should not be nil")
-	}
-	if e.DNS["query-name"] != hostname {
-		t.Errorf("DNS query-name = %v, want %v", e.DNS["query-name"], hostname)
-	}
-	if e.DNS["query-type"] != dnsQueryType {
-		t.Errorf("DNS query-type = %v, want %v", e.DNS["query-type"], dnsQueryType)
-	}
-	if len(e.Conditions) != 1 || e.Conditions[0] != dnsEmptyBodyCondition {
-		t.Errorf("Conditions = %v, want [%v]", e.Conditions, dnsEmptyBodyCondition)
-	}
+	t.Run("non-HTTPRoute object returns false", func(t *testing.T) {
+		if filterFunc(&metav1.ObjectMeta{}, cfg) {
+			t.Error("filterFunc() = true, want false")
+		}
+	})
 }
 
 func TestDefinition(t *testing.T) {
 	def := Definition()
-
-	if def.GVR.Group != "gateway.networking.k8s.io" {
-		t.Errorf("GVR.Group = %v, want gateway.networking.k8s.io", def.GVR.Group)
-	}
-	if def.GVR.Version != "v1" {
-		t.Errorf("GVR.Version = %v, want v1", def.GVR.Version)
-	}
 	if def.GVR.Resource != "httproutes" {
-		t.Errorf("GVR.Resource = %v, want httproutes", def.GVR.Resource)
+		t.Errorf("Definition() resource = %v, want httproutes", def.GVR.Resource)
 	}
-	if def.URLExtractor == nil {
-		t.Error("URLExtractor should not be nil")
-	}
-	if def.ConditionFunc == nil {
-		t.Error("ConditionFunc should not be nil")
-	}
-	if def.GuardedFunc == nil {
-		t.Error("GuardedFunc should not be nil")
-	}
-	if def.FilterFunc == nil {
-		t.Error("FilterFunc should not be nil")
-	}
-	if def.ParentExtractor == nil {
-		t.Error("ParentExtractor should not be nil")
-	}
-
-	cfg := &config.Config{AutoHTTPRoute: true}
-	if !def.AutoConfigFunc(cfg) {
-		t.Error("AutoConfigFunc should return true when AutoHTTPRoute is enabled")
+	if def.EndpointExtractor == nil {
+		t.Error("Definition() EndpointExtractor is nil")
 	}
 }

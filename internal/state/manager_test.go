@@ -187,6 +187,7 @@ func TestManager_NoWriteOnNoChange(t *testing.T) {
 	}
 
 	m.AddOrUpdate("test.default.services", e1, true)
+	m.ForceWrite()
 
 	data1, err := os.ReadFile(outputFile)
 	if err != nil {
@@ -194,6 +195,7 @@ func TestManager_NoWriteOnNoChange(t *testing.T) {
 	}
 
 	m.AddOrUpdate("test.default.services", e1, true)
+	m.ForceWrite()
 
 	data2, err := os.ReadFile(outputFile)
 	if err != nil {

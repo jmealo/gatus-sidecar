@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"reflect"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,30 +21,43 @@ func Definition() *resources.ResourceDefinition {
 			Version:  "v1",
 			Resource: "services",
 		},
-		TargetType:     reflect.TypeOf(corev1.Service{}),
-		ConvertFunc:    resources.CreateConvertFunc(reflect.TypeOf(corev1.Service{})),
-		AutoConfigFunc: func(cfg *config.Config) bool { return cfg.AutoService },
-		URLExtractor:   urlExtractor,
-		ConditionFunc:  conditionFunc,
+		TargetType:        reflect.TypeOf(corev1.Service{}),
+		ConvertFunc:       resources.CreateConvertFunc(reflect.TypeOf(corev1.Service{})),
+		AutoConfigFunc:    func(cfg *config.Config) bool { return cfg.AutoService },
+		EndpointExtractor: endpointExtractor,
+		ConditionFunc:     conditionFunc,
 	}
 }
 
-func urlExtractor(obj metav1.Object) string {
-	service, ok := obj.(*corev1.Service)
-	if !ok || len(service.Spec.Ports) == 0 {
-		return ""
+func endpointExtractor(obj metav1.Object) []*endpoint.Endpoint {
+	svc, ok := obj.(*corev1.Service)
+	if !ok {
+		return nil
 	}
 
-	port := service.Spec.Ports[0].Port
-	protocol := strings.ToLower(string(service.Spec.Ports[0].Protocol))
+	if len(svc.Spec.Ports) == 0 {
+		return nil
+	}
 
-	return fmt.Sprintf("%s://%s.%s.svc:%d",
-		protocol,
-		service.Name,
-		service.Namespace,
-		port)
+	// For services, we usually just monitor the first port unless specified otherwise
+	port := svc.Spec.Ports[0]
+	protocol := "http"
+	if port.Port == 443 || port.Name == "https" {
+		protocol = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s.%s.svc:%d", protocol, svc.Name, svc.Namespace, port.Port)
+
+	return []*endpoint.Endpoint{
+		{
+			Name: svc.Name,
+			URL:  url,
+			Host: fmt.Sprintf("%s.%s.svc", svc.Name, svc.Namespace),
+			Path: "/",
+		},
+	}
 }
 
 func conditionFunc(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
-	e.Conditions = []string{"[CONNECTED] == true"}
+	e.Conditions = []string{"[STATUS] == 200"}
 }

@@ -1,7 +1,10 @@
 package ingressroute
 
 import (
+	"fmt"
+	"reflect"
 	"regexp"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -12,27 +15,20 @@ import (
 	"github.com/home-operations/gatus-sidecar/internal/resources"
 )
 
-const (
-	dnsTestURL            = "1.1.1.1"
-	dnsEmptyBodyCondition = "len([BODY]) == 0"
-	dnsQueryType          = "A"
-)
-
-var hostRegex = regexp.MustCompile("Host\\(`([^`]+)`\\)")
-
-// Definition creates a resource definition for Traefik IngressRoute resources
+// Definition creates a resource definition for IngressRoute resources
 func Definition() *resources.ResourceDefinition {
 	return &resources.ResourceDefinition{
 		GVR: schema.GroupVersionResource{
-			Group:    "traefik.io",
+			Group:    "traefik.containo.us",
 			Version:  "v1alpha1",
 			Resource: "ingressroutes",
 		},
-		ConvertFunc:    convertFunc,
-		AutoConfigFunc: func(cfg *config.Config) bool { return cfg.AutoIngressRoute },
-		URLExtractor:   urlExtractor,
-		ConditionFunc:  conditionFunc,
-		GuardedFunc:    guardedFunc,
+		TargetType:        reflect.TypeOf(unstructured.Unstructured{}),
+		ConvertFunc:       convertFunc,
+		AutoConfigFunc:    func(cfg *config.Config) bool { return cfg.AutoIngressRoute },
+		EndpointExtractor: endpointExtractor,
+		ConditionFunc:     conditionFunc,
+		GuardedFunc:       guardedFunc,
 	}
 }
 
@@ -40,21 +36,58 @@ func convertFunc(u *unstructured.Unstructured) (metav1.Object, error) {
 	return u, nil
 }
 
-func urlExtractor(obj metav1.Object) string {
+func endpointExtractor(obj metav1.Object) []*endpoint.Endpoint {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
-		return ""
+		return nil
 	}
 
-	hostname := getFirstHostname(u)
-	if hostname == "" {
-		return ""
+	spec, ok := u.Object["spec"].(map[string]any)
+	if !ok {
+		return nil
 	}
 
+	routes, ok := spec["routes"].([]any)
+	if !ok {
+		return nil
+	}
+
+	var endpoints []*endpoint.Endpoint
+
+	protocol := "http"
 	if hasTLS(u) {
-		return "https://" + hostname
+		protocol = "https"
 	}
-	return "http://" + hostname
+
+	for _, r := range routes {
+		route, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		match, ok := route["match"].(string)
+		if !ok {
+			continue
+		}
+
+		host := extractHostFromMatch(match)
+		if host == "" {
+			continue
+		}
+
+		path := "/" // Default path if not specified in match
+
+		url := fmt.Sprintf("%s://%s%s", protocol, host, path)
+		
+		endpoints = append(endpoints, &endpoint.Endpoint{
+			Name: u.GetName(),
+			URL:  url,
+			Host: host,
+			Path: path,
+		})
+	}
+
+	return endpoints
 }
 
 func conditionFunc(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
@@ -67,53 +100,49 @@ func guardedFunc(obj metav1.Object, e *endpoint.Endpoint) {
 		return
 	}
 
-	hostname := getFirstHostname(u)
-	if hostname == "" {
-		return
+	host := ""
+	spec, ok := u.Object["spec"].(map[string]any)
+	if ok {
+		routes, ok := spec["routes"].([]any)
+		if ok && len(routes) > 0 {
+			if route, ok := routes[0].(map[string]any); ok {
+				if match, ok := route["match"].(string); ok {
+					host = extractHostFromMatch(match)
+				}
+			}
+		}
 	}
 
-	e.URL = dnsTestURL
+	if host != "" {
+		applyGuardedTemplate(host, e)
+	}
+}
+
+func applyGuardedTemplate(dnsQueryName string, e *endpoint.Endpoint) {
+	e.URL = "1.1.1.1"
 	e.DNS = map[string]any{
-		"query-name": hostname,
-		"query-type": dnsQueryType,
+		"query-name": dnsQueryName,
+		"query-type": "A",
 	}
-	e.Conditions = []string{dnsEmptyBodyCondition}
+	e.Conditions = []string{"len([BODY]) == 0"}
 }
 
-func getFirstHostname(u *unstructured.Unstructured) string {
-	routes, found, err := unstructured.NestedSlice(u.Object, "spec", "routes")
-	if err != nil || !found || len(routes) == 0 {
-		return ""
-	}
-
-	for _, route := range routes {
-		routeMap, ok := route.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		match, ok := routeMap["match"].(string)
-		if !ok {
-			continue
-		}
-
-		if hostname := extractHostFromMatch(match); hostname != "" {
-			return hostname
-		}
-	}
-
-	return ""
-}
+// Helper functions
 
 func extractHostFromMatch(match string) string {
-	matches := hostRegex.FindStringSubmatch(match)
-	if len(matches) >= 2 {
-		return matches[1]
+	re := regexp.MustCompile(`Host\(\s*['"\x60]?([^'")]*?)['"\x60]?\s*\)`)
+	res := re.FindStringSubmatch(match)
+	if len(res) > 1 {
+		return strings.Trim(res[1], "'\"`")
 	}
 	return ""
 }
 
 func hasTLS(u *unstructured.Unstructured) bool {
-	tls, found, err := unstructured.NestedMap(u.Object, "spec", "tls")
-	return err == nil && found && tls != nil
+	spec, ok := u.Object["spec"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = spec["tls"]
+	return ok
 }

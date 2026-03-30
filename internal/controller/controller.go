@@ -1,44 +1,55 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
 	"maps"
-	"time"
+	"text/template"
 
 	"gopkg.in/yaml.v3"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/home-operations/gatus-sidecar/internal/config"
-	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 	"github.com/home-operations/gatus-sidecar/internal/resources"
 	"github.com/home-operations/gatus-sidecar/internal/state"
 )
 
 type Controller struct {
 	gvr           schema.GroupVersionResource
-	options       metav1.ListOptions
 	handler       resources.ResourceHandler
 	convert       func(*unstructured.Unstructured) (metav1.Object, error)
 	stateManager  *state.Manager
 	dynamicClient dynamic.Interface
+	informer      cache.SharedIndexInformer
+}
+
+type TemplateContext struct {
+	Name      string
+	Namespace string
+	Resource  string
+	Host      string
+	Path      string
 }
 
 // New creates a controller using a ResourceDefinition
-func New(definition *resources.ResourceDefinition, stateManager *state.Manager, dynamicClient dynamic.Interface) *Controller {
+func New(definition *resources.ResourceDefinition, stateManager *state.Manager, dynamicClient dynamic.Interface, informerFactory dynamicinformer.DynamicSharedInformerFactory, namespace string) *Controller {
+	informer := informerFactory.ForResource(definition.GVR).Informer()
+
 	return &Controller{
 		gvr:           definition.GVR,
-		options:       metav1.ListOptions{},
 		handler:       resources.NewHandler(definition, dynamicClient),
 		stateManager:  stateManager,
 		dynamicClient: dynamicClient,
 		convert:       definition.ConvertFunc,
+		informer:      informer,
 	}
 }
 
@@ -47,143 +58,158 @@ func (c *Controller) GetResource() string {
 }
 
 func (c *Controller) Run(ctx context.Context, cfg *config.Config) error {
-	// Initial listing to populate state
-	if err := c.initialList(ctx, cfg); err != nil {
-		return fmt.Errorf("initial list failed for %s: %w", c.gvr.Resource, err)
-	}
+	slog.Info("starting informer for resource", "resource", c.gvr.Resource)
 
-	// Watch loop
-	for {
-		if err := c.watchLoop(ctx, cfg); err != nil {
-			slog.Error("watch loop error", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(5 * time.Second):
-		}
-	}
-}
+	c.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			c.processObject(ctx, cfg, obj)
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			c.processObject(ctx, cfg, newObj)
+		},
+		DeleteFunc: func(obj any) {
+			c.processDelete(obj)
+		},
+	})
 
-func (c *Controller) initialList(ctx context.Context, cfg *config.Config) error {
-	list, err := c.dynamicClient.Resource(c.gvr).Namespace(cfg.Namespace).List(ctx, c.options)
-	if err != nil {
-		return fmt.Errorf("list %s: %w", c.gvr.Resource, err)
-	}
-
-	changed := false
-
-	for _, item := range list.Items {
-		obj, err := c.convert(&item)
-		if err != nil {
-			slog.Error("failed to convert resource", "resource", c.gvr.Resource, "error", err)
-			continue
-		}
-
-		if c.handleEvent(ctx, cfg, obj, watch.Added, false) {
-			changed = true
-		}
-	}
-
-	if changed {
-		c.stateManager.ForceWrite()
-	}
-
+	c.informer.Run(ctx.Done())
 	return nil
 }
 
-func (c *Controller) watchLoop(ctx context.Context, cfg *config.Config) error {
-	w, err := c.dynamicClient.Resource(c.gvr).Namespace(cfg.Namespace).Watch(ctx, c.options)
-	if err != nil {
-		return fmt.Errorf("watch %s: %w", c.gvr.Resource, err)
-	}
-	defer w.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case evt, ok := <-w.ResultChan():
-			if !ok {
-				return fmt.Errorf("watch channel closed")
-			}
-			c.processEvent(ctx, cfg, evt)
-		}
-	}
-}
-
-func (c *Controller) processEvent(ctx context.Context, cfg *config.Config, evt watch.Event) {
-	obj, err := c.convertEvent(evt)
-	if err != nil {
-		slog.Error("failed to process event", "error", err)
+func (c *Controller) processObject(ctx context.Context, cfg *config.Config, obj any) {
+	unstructuredObj, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		slog.Error("expected unstructured object", "type", fmt.Sprintf("%T", obj))
 		return
 	}
 
-	c.handleEvent(ctx, cfg, obj, evt.Type, true)
-}
-
-func (c *Controller) convertEvent(evt watch.Event) (metav1.Object, error) {
-	unstructuredObj, ok := evt.Object.(*unstructured.Unstructured)
-	if !ok {
-		return nil, fmt.Errorf("unexpected object type: %T", evt.Object)
+	metaObj, err := c.convert(unstructuredObj)
+	if err != nil {
+		slog.Error("failed to convert object", "error", err)
+		return
 	}
 
-	return c.convert(unstructuredObj)
+	c.handleEvent(ctx, cfg, metaObj)
 }
 
-func (c *Controller) handleEvent(ctx context.Context, cfg *config.Config, obj metav1.Object, eventType watch.EventType, write bool) bool {
+func (c *Controller) processDelete(obj any) {
+	unstructuredObj, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			slog.Error("unexpected object type in delete", "type", fmt.Sprintf("%T", obj))
+			return
+		}
+		unstructuredObj, ok = tombstone.Obj.(*unstructured.Unstructured)
+		if !ok {
+			slog.Error("expected unstructured object in tombstone", "type", fmt.Sprintf("%T", tombstone.Obj))
+			return
+		}
+	}
+
+	name := unstructuredObj.GetName()
+	namespace := unstructuredObj.GetNamespace()
+	
+	// Since we don't know the paths of the deleted object easily from the tombstone without re-extracting,
+	// and the state manager uses a key that might include the path, we might need a more robust way to 
+	// cleanup all endpoints related to this resource.
+	// For now, we'll prefix-match in the state manager if we implement that, or just handle root.
+	
+	key := fmt.Sprintf("%s.%s.%s", name, namespace, c.gvr.Resource)
+	c.removeFromState(key, c.gvr.Resource, name, namespace)
+}
+
+func (c *Controller) handleEvent(ctx context.Context, cfg *config.Config, obj metav1.Object) {
 	name := obj.GetName()
 	namespace := obj.GetNamespace()
 	annotations := obj.GetAnnotations()
 	resource := c.gvr.Resource
-	key := fmt.Sprintf("%s.%s.%s", name, namespace, resource)
 
-	// Early returns for deletion or non-processable resources
-	if !c.handler.ShouldProcess(obj, cfg) || eventType == watch.Deleted {
-		c.removeFromState(key, resource, name, namespace)
-		return true // Change detected
+	// Early returns for non-processable resources
+	if !c.handler.ShouldProcess(obj, cfg) {
+		// Cleanup logic here needs to be path-aware
+		return
 	}
 
-	// Validate URL availability
-	url := c.handler.ExtractURL(obj)
-	if url == "" {
-		slog.Warn("resource has no url", "resource", resource, "name", name, "namespace", namespace)
-		return false
+	// Extract multiple endpoints
+	endpoints := c.handler.ExtractEndpoints(obj)
+	if len(endpoints) == 0 {
+		return
 	}
 
-	// Check if endpoint is explicitly disabled
+	// Check if explicitly disabled
 	if c.isEndpointDisabled(annotations, cfg) {
-		c.removeFromState(key, resource, name, namespace)
-		return true // Change detected
+		return
 	}
 
-	// Process template data
-	templateData, err := c.buildTemplateData(ctx, obj, cfg)
+	// Process template data from annotations
+	annotationTemplateData, err := c.buildTemplateData(ctx, obj, cfg)
 	if err != nil {
 		slog.Error("failed to build template data", "resource", resource, "name", name, "namespace", namespace, "error", err)
-		return false
+		return
 	}
 
-	// Create and configure endpoint
-	e := &endpoint.Endpoint{
-		Name:     name,
-		URL:      url,
-		Interval: cfg.DefaultInterval.String(),
-		Guarded:  c.isGuardedEndpoint(templateData),
+	for i, e := range endpoints {
+		// Prepare template context
+		tmplCtx := TemplateContext{
+			Name:      name,
+			Namespace: namespace,
+			Resource:  resource,
+			Host:      e.Host,
+			Path:      e.Path,
+		}
+
+		// Apply naming and grouping templates
+		e.Name = c.renderTemplate(cfg.DefaultNameTemplate, tmplCtx, name)
+		if groupTemplate, ok := annotations["gatus.io/group-template"]; ok {
+			e.Group = c.renderTemplate(groupTemplate, tmplCtx, namespace)
+		} else {
+			e.Group = c.renderTemplate(cfg.DefaultGroupTemplate, tmplCtx, namespace)
+		}
+		
+		if nameTemplate, ok := annotations["gatus.io/name-template"]; ok {
+			e.Name = c.renderTemplate(nameTemplate, tmplCtx, e.Name)
+		}
+
+		e.Interval = cfg.DefaultInterval.String()
+		e.Guarded = c.isGuardedEndpoint(annotationTemplateData)
+
+		c.handler.ApplyTemplate(cfg, obj, e)
+		if annotationTemplateData != nil {
+			e.ApplyTemplate(annotationTemplateData)
+		}
+
+		// Unique key including path to prevent collisions
+		key := fmt.Sprintf("%s.%s.%s.%d", name, namespace, resource, i)
+		if e.Path != "" && e.Path != "/" {
+			key = fmt.Sprintf("%s.%s.%s.%s", name, namespace, resource, e.Path)
+		}
+
+		changed := c.stateManager.AddOrUpdate(key, e, true)
+		if changed {
+			slog.Info("updated endpoint in state", "resource", resource, "name", e.Name, "url", e.URL)
+		}
+	}
+}
+
+func (c *Controller) renderTemplate(tmplStr string, ctx TemplateContext, fallback string) string {
+	if tmplStr == "" {
+		return fallback
 	}
 
-	c.handler.ApplyTemplate(cfg, obj, e)
-	if templateData != nil {
-		e.ApplyTemplate(templateData)
+	tmpl, err := template.New("gatus").Parse(tmplStr)
+	if err != nil {
+		slog.Error("failed to parse template", "template", tmplStr, "error", err)
+		return fallback
 	}
 
-	// Update state
-	changed := c.stateManager.AddOrUpdate(key, e, write)
-	if changed {
-		slog.Info("updated endpoint in state", "resource", resource, "name", name, "namespace", namespace, "write", write)
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, ctx); err != nil {
+		slog.Error("failed to execute template", "template", tmplStr, "error", err)
+		return fallback
 	}
 
-	return changed // Change detected
+	return buf.String()
 }
 
 func (c *Controller) isEndpointDisabled(annotations map[string]string, cfg *config.Config) bool {

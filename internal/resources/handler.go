@@ -3,80 +3,79 @@ package resources
 import (
 	"context"
 
-	"github.com/home-operations/gatus-sidecar/internal/config"
-	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
+
+	"github.com/home-operations/gatus-sidecar/internal/config"
+	"github.com/home-operations/gatus-sidecar/internal/endpoint"
 )
 
-// ResourceHandler defines the interface for handling different Kubernetes resources
+// ResourceHandler defines the interface for processing specific Kubernetes resources
 type ResourceHandler interface {
-	// ShouldProcess returns true if this resource should be processed based on config filters
 	ShouldProcess(obj metav1.Object, cfg *config.Config) bool
-	// ExtractURL extracts the URL from the resource
-	ExtractURL(obj metav1.Object) string
-	// ApplyTemplate applies the resource-specific template to the endpoint
+	ExtractEndpoints(obj metav1.Object) []*endpoint.Endpoint
 	ApplyTemplate(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint)
-	// GetParentAnnotations retrieves annotations from the parent resource, if applicable
 	GetParentAnnotations(ctx context.Context, obj metav1.Object) map[string]string
 }
 
-// Handler implements ResourceHandler using ResourceDefinition
-type Handler struct {
+type resourceHandler struct {
 	definition    *ResourceDefinition
 	dynamicClient dynamic.Interface
 }
 
-var _ ResourceHandler = (*Handler)(nil)
-
-// NewHandler creates a new handler with the given resource definition
-func NewHandler(definition *ResourceDefinition, dynamicClient dynamic.Interface) *Handler {
-	return &Handler{
+// NewHandler creates a new resource handler
+func NewHandler(definition *ResourceDefinition, dynamicClient dynamic.Interface) ResourceHandler {
+	return &resourceHandler{
 		definition:    definition,
 		dynamicClient: dynamicClient,
 	}
 }
 
-func (h *Handler) ShouldProcess(obj metav1.Object, cfg *config.Config) bool {
-	// Check custom filter first if provided
-	if h.definition.FilterFunc != nil && !h.definition.FilterFunc(obj, cfg) {
+func (h *resourceHandler) ShouldProcess(obj metav1.Object, cfg *config.Config) bool {
+	// Check if auto-config is enabled for this resource type
+	if h.definition.AutoConfigFunc != nil && h.definition.AutoConfigFunc(cfg) {
+		// If auto-config is enabled, still allow the filter function to reject objects
+		if h.definition.FilterFunc != nil {
+			return h.definition.FilterFunc(obj, cfg)
+		}
+		return true
+	}
+
+	// Otherwise, check if the required annotations are present
+	if !HasRequiredAnnotations(obj.GetAnnotations(), cfg) {
 		return false
 	}
 
-	// Check auto-config setting
-	if h.definition.AutoConfigFunc != nil {
-		if h.definition.AutoConfigFunc(cfg) {
-			return true
-		}
+	// Still apply filter function if present
+	if h.definition.FilterFunc != nil {
+		return h.definition.FilterFunc(obj, cfg)
 	}
 
-	// If auto is disabled, only process if it has required annotations
-	return HasRequiredAnnotations(obj, cfg)
+	return true
 }
 
-func (h *Handler) ExtractURL(obj metav1.Object) string {
-	if h.definition.URLExtractor == nil {
-		return ""
+func (h *resourceHandler) ExtractEndpoints(obj metav1.Object) []*endpoint.Endpoint {
+	if h.definition.EndpointExtractor != nil {
+		return h.definition.EndpointExtractor(obj)
 	}
-	return h.definition.URLExtractor(obj)
+	return nil
 }
 
-func (h *Handler) ApplyTemplate(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
-	// Apply guarded template if needed
-	if e.Guarded && h.definition.GuardedFunc != nil {
-		h.definition.GuardedFunc(obj, e)
-		return
-	}
-
-	// Apply normal conditions
+func (h *resourceHandler) ApplyTemplate(cfg *config.Config, obj metav1.Object, e *endpoint.Endpoint) {
+	// Apply base conditions
 	if h.definition.ConditionFunc != nil {
 		h.definition.ConditionFunc(cfg, obj, e)
 	}
+
+	// Apply guarded settings if applicable
+	if e.Guarded && h.definition.GuardedFunc != nil {
+		h.definition.GuardedFunc(obj, e)
+	}
 }
 
-func (h *Handler) GetParentAnnotations(ctx context.Context, obj metav1.Object) map[string]string {
-	if h.definition.ParentExtractor == nil {
-		return nil
+func (h *resourceHandler) GetParentAnnotations(ctx context.Context, obj metav1.Object) map[string]string {
+	if h.definition.ParentExtractor != nil {
+		return h.definition.ParentExtractor(ctx, obj, h.dynamicClient)
 	}
-	return h.definition.ParentExtractor(ctx, obj, h.dynamicClient)
+	return nil
 }

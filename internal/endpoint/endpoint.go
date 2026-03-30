@@ -7,6 +7,8 @@ type Endpoint struct {
 	Name       string         `yaml:"name"`
 	Group      string         `yaml:"group,omitempty"`
 	URL        string         `yaml:"url"`
+	Host       string         `yaml:"-"` // Internal use for templating
+	Path       string         `yaml:"-"` // Internal use for templating
 	Conditions []string       `yaml:"conditions,omitempty"`
 	Interval   string         `yaml:"interval"`
 	DNS        map[string]any `yaml:"dns,omitempty"`

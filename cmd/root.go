@@ -51,20 +51,23 @@ func main() {
 	// Initialize controllers slice
 	controllers := []*controller.Controller{}
 
-	// Determine if default controllers should be enabled
+	// Determine if default controllers (Ingress/Service) should be enabled
+	// If any specific resource is enabled, we don't use the "default all" logic
 	defaultControllers := !cfg.EnableHTTPRoute && !cfg.EnableIngress && !cfg.EnableService && !cfg.EnableIngressRoute
 
-	// Conditionally register controllers based on config
-	if cfg.EnableHTTPRoute || cfg.AutoHTTPRoute || defaultControllers {
-		controllers = append(controllers, controller.New(httproute.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
-	}
+	// Ingress and Service are considered "standard" and enabled by default
 	if cfg.EnableIngress || cfg.AutoIngress || defaultControllers {
 		controllers = append(controllers, controller.New(ingress.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
 	if cfg.EnableService || cfg.AutoService || defaultControllers {
 		controllers = append(controllers, controller.New(service.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
-	if cfg.EnableIngressRoute || cfg.AutoIngressRoute || defaultControllers {
+
+	// Gateway API and Traefik are optional and require explicit opt-in or auto-discovery flags
+	if cfg.EnableHTTPRoute || cfg.AutoHTTPRoute {
+		controllers = append(controllers, controller.New(httproute.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
+	}
+	if cfg.EnableIngressRoute || cfg.AutoIngressRoute {
 		controllers = append(controllers, controller.New(ingressroute.Definition(), stateManager, dc, informerFactory, cfg.Namespace))
 	}
 

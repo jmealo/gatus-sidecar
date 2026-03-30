@@ -58,6 +58,10 @@ func (c *Controller) GetResource() string {
 }
 
 func (c *Controller) Run(ctx context.Context, cfg *config.Config) error {
+	if !c.informer.HasSynced() {
+		return fmt.Errorf("informer for %s failed to sync, skipping execution", c.gvr.Resource)
+	}
+
 	slog.Info("starting informer for resource", "resource", c.gvr.Resource)
 
 	c.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{

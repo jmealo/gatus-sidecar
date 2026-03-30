@@ -84,11 +84,10 @@ func main() {
 	
 	for gvr, synced := range informerFactory.WaitForCacheSync(syncCtx.Done()) {
 		if !synced {
-			slog.Error("Failed to sync informer cache", "resource", gvr.Resource)
-			os.Exit(1)
+			slog.Warn("Failed to sync informer cache", "resource", gvr.Resource)
 		}
 	}
-	slog.Info("Informers synced")
+	slog.Info("Informers sync completed (some might have failed)")
 
 	// Run all controllers concurrently
 	runControllers(ctx, cfg, controllers)

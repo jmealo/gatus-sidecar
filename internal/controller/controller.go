@@ -164,7 +164,13 @@ func (c *Controller) handleEvent(ctx context.Context, cfg *config.Config, obj me
 		}
 
 		// Apply naming and grouping templates
-		e.Name = c.renderTemplate(cfg.DefaultNameTemplate, tmplCtx, name)
+		// Use a more descriptive default name that includes path to prevent Gatus panics
+		defaultName := name
+		if e.Path != "" && e.Path != "/" {
+			defaultName = fmt.Sprintf("%s (%s)", name, e.Path)
+		}
+
+		e.Name = c.renderTemplate(cfg.DefaultNameTemplate, tmplCtx, defaultName)
 		if groupTemplate, ok := annotations["gatus.io/group-template"]; ok {
 			e.Group = c.renderTemplate(groupTemplate, tmplCtx, namespace)
 		} else {

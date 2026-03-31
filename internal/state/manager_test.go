@@ -242,6 +242,33 @@ func TestManager_ConcurrentOperations(t *testing.T) {
 	}
 }
 
+func TestManager_DuplicateNamePrevention(t *testing.T) {
+	tmpDir := t.TempDir()
+	outputFile := filepath.Join(tmpDir, "test.yaml")
+	m := NewManager(outputFile)
+
+	e1 := &endpoint.Endpoint{Name: "duplicate", Group: "g1", URL: "https://a.com"}
+	e2 := &endpoint.Endpoint{Name: "duplicate", Group: "g1", URL: "https://b.com"}
+
+	m.AddOrUpdate("key1", e1, false)
+	m.AddOrUpdate("key2", e2, false)
+	m.ForceWrite()
+
+	data, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("Failed to read output file: %v", err)
+	}
+
+	content := string(data)
+	if !indexOfContains(content, "name: duplicate") || !indexOfContains(content, "name: duplicate-1") {
+		t.Errorf("Expected both duplicate and duplicate-1 in output, got: %s", content)
+	}
+}
+
+func indexOfContains(s, substr string) bool {
+	return indexOf(s, substr) != -1
+}
+
 func containsInOrder(s string, substrs ...string) bool {
 	idx := 0
 	for _, substr := range substrs {

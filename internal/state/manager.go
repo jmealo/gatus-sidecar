@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"reflect"
@@ -127,9 +128,9 @@ func (m *Manager) GetCurrentState() map[string]*endpoint.Endpoint {
 
 // writeState writes the current state to disk (must be called with mutex held)
 func (m *Manager) writeState() {
-	state := m.getCurrentState()
+	endpoints := m.getUniqueEndpoints()
 
-	yamlData, err := yaml.Marshal(state)
+	yamlData, err := yaml.Marshal(map[string]any{"endpoints": endpoints})
 	if err != nil {
 		slog.Error("failed to marshal state to yaml", "error", err)
 		return
@@ -140,28 +141,55 @@ func (m *Manager) writeState() {
 		return
 	}
 
-	endpointCount := len(m.endpoints)
-	slog.Info("wrote consolidated state file", "file", m.outputFile, "endpoints", endpointCount)
+	slog.Info("wrote consolidated state file", "file", m.outputFile, "endpoints", len(endpoints))
+}
+
+// getUniqueEndpoints returns a sorted slice of endpoints with guaranteed unique Name+Group combinations
+func (m *Manager) getUniqueEndpoints() []*endpoint.Endpoint {
+	// Convert to slice
+	all := make([]*endpoint.Endpoint, 0, len(m.endpoints))
+	for _, e := range m.endpoints {
+		// Clone to avoid modifying the original in the map
+		clone := *e
+		all = append(all, &clone)
+	}
+
+	// Sort by Name and Group for deterministic suffixing
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Group != all[j].Group {
+			return all[i].Group < all[j].Group
+		}
+		return all[i].Name < all[j].Name
+	})
+
+	seen := make(map[string]int)
+	result := make([]*endpoint.Endpoint, 0, len(all))
+
+	for _, e := range all {
+		id := e.Group + "/" + e.Name
+		if count, exists := seen[id]; exists {
+			count++
+			seen[id] = count
+			originalName := e.Name
+			e.Name = fmt.Sprintf("%s-%d", e.Name, count)
+			slog.Warn("duplicate name+group detected, appended suffix", 
+				"group", e.Group, 
+				"originalName", originalName, 
+				"newName", e.Name,
+				"url", e.URL)
+		} else {
+			seen[id] = 0
+		}
+		result = append(result, e)
+	}
+
+	return result
 }
 
 // getCurrentState returns the current state as a map suitable for YAML generation
 // (must be called with mutex held)
 func (m *Manager) getCurrentState() map[string]any {
-	// Convert to slice and sort for consistent output
-	endpoints := make([]*endpoint.Endpoint, 0, len(m.endpoints))
-	for _, e := range m.endpoints {
-		endpoints = append(endpoints, e)
-	}
-
-	// Sort by name for consistent ordering
-	sort.Slice(endpoints, func(i, j int) bool {
-		if endpoints[i].Group != endpoints[j].Group {
-			return endpoints[i].Group < endpoints[j].Group
-		}
-		return endpoints[i].Name < endpoints[j].Name
-	})
-
 	return map[string]any{
-		"endpoints": endpoints,
+		"endpoints": m.getUniqueEndpoints(),
 	}
 }

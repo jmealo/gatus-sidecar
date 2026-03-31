@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"strings"
 	"text/template"
 
 	"gopkg.in/yaml.v3"
@@ -164,10 +165,13 @@ func (c *Controller) handleEvent(ctx context.Context, cfg *config.Config, obj me
 		}
 
 		// Apply naming and grouping templates
-		// Use a more descriptive default name that includes path to prevent Gatus panics
+		// Use a more descriptive default name that includes host and path to prevent Gatus panics
 		defaultName := name
 		if e.Path != "" && e.Path != "/" {
 			defaultName = fmt.Sprintf("%s (%s)", name, e.Path)
+		} else if e.Host != "" && !strings.Contains(e.Host, name) {
+			// If it's a root path but the host is different from the resource name, include host
+			defaultName = fmt.Sprintf("%s [%s]", name, e.Host)
 		}
 
 		e.Name = c.renderTemplate(cfg.DefaultNameTemplate, tmplCtx, defaultName)
